@@ -1,0 +1,807 @@
+Option Explicit
+
+' Модуль: Модуль содержит процедуры и функции для миграции данных между базами Postgres.
+' Автор: [ZeRoN]
+' Дата создания: [04.02.2025]
+' Дата изменения: [13.05.2025]
+
+
+' Константы
+Private Const MAX_LINE_LENGTH As Integer = 80 ' Максимальная длина строки для форматирования
+
+' Глобальные переменные (уровень модуля)
+Private dbCurrent As DAO.Database                        ' Объект базы данных для текущей сессии
+Private strPostgresSQLConnectionString As String         ' Строка подключения к PostgreSQL (источник данных)
+Private strPostgresToSQLConnectionString As String       ' Строка подключения к PostgreSQL (целевая база данных)
+Private dictTableFieldsByTable As Object                 ' Словарь для хранения информации о полях таблиц
+
+' Вспомогательные функции (расположены в логическом порядке)
+
+'''
+' Функция: DivideText
+' Описание: Разбивает длинную строку на части заданной длины для обработки в SQL-запросах.
+'
+' Аргументы:
+'   strText (String):  Строка, которую необходимо разбить на части.
+'   intChunkSize (Integer): Максимальная длина каждой части строки.
+'
+' Возвращает:
+'   String: Строка, разбитая на части, соединенные оператором конкатенации VBA ("' & '").
+'
+' Пример:
+'   DivideText("ОченьДлиннаяСтрокаДляРазбиения", 10)  -> "ОченьДлин' & 'наяСтрока' & 'ДляРазбиен' & 'ия"
+'''
+Function DivideText(ByVal strText As String, ByVal intChunkSize As Integer) As String
+    Dim i As Integer                                  ' Счетчик цикла
+    Dim strResult As String                           ' Строка для накопления результата
+
+    ' Если длина строки меньше или равна размеру чанка, возвращаем исходную строку
+    If Len(strText) <= intChunkSize Then
+        DivideText = strText
+        Exit Function
+    End If
+
+    strResult = ""                                    ' Инициализируем строку результата
+
+    ' Цикл по строке с шагом intChunkSize
+    For i = 1 To Len(strText) Step intChunkSize
+        ' Если strResult не пуста, добавляем разделитель " & '"
+        If strResult <> "" Then
+            strResult = strResult & "' & '"
+        End If
+
+        ' Добавляем к результату часть строки
+        strResult = strResult & Mid(strText, i, intChunkSize)
+    Next i
+
+    ' Возвращаем разбитую строку
+    DivideText = strResult
+
+End Function
+
+'''
+' Функция: SwapDayMonth
+' Описание:  Изменяет порядок дня и месяца в строке, представляющей дату, и заключает её в символы "#".
+'
+' Аргументы:
+'   dateString (Variant): Строка с датой в формате "DD/MM/YYYY" или "MM/DD/YYYY".
+'
+' Возвращает:
+'   String: Строка с датой, где день и месяц поменяны местами, в формате "#MM/DD/YYYY#".
+'
+' Пример:
+'   SwapDayMonth("25/12/2023")  -> "#12/25/2023#"
+'''
+Function SwapDayMonth(ByVal dateString As Variant) As String
+    Dim arrDataParts As Variant                         ' Массив для хранения частей даты
+    Dim strDay As String                                ' День
+    Dim strMonth As String                              ' Месяц
+    Dim strYear As String                               ' Год
+
+    ' Разделяем строку даты на части
+    arrDataParts = Split(Replace(CStr(dateString), "#", ""), "/")
+    
+    ' Получаем день, месяц и год
+    strDay = arrDataParts(0)
+    strMonth = arrDataParts(1)
+    strYear = arrDataParts(2)
+
+    ' Формируем новую строку даты с поменянными местами днем и месяцем
+    SwapDayMonth = "#" & strMonth & "/" & strDay & "/" & strYear & "#"
+
+End Function
+
+'''
+' Подпрограмма: LogMessage
+' Описание:  Записывает сообщение в лог-файл MigrationLog.html с указанием текущей даты и времени.
+'
+' Аргументы:
+'   message (String): Сообщение, которое необходимо записать в лог-файл.
+'
+' Пример:
+'   LogMessage "Начало процесса импорта данных."
+'''
+Sub LogMessage(ByVal message As String)
+    Dim fso As Object                                   ' Объект FileSystemObject для работы с файловой системой
+    Dim logFile As Object                               ' Объект TextStream для записи в текстовый файл
+    Dim strFilePath As String                           ' Полный путь к лог-файлу
+
+    strFilePath = CurrentProject.Path & "\MigrationLog.html" ' Формируем путь к лог-файлу
+
+    ' Создаем объект FileSystemObject
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    ' Открываем лог-файл для добавления (режим 8 - Append, True - Create if not exist)
+    Set logFile = fso.OpenTextFile(strFilePath, 8, True)
+
+    ' Записываем сообщение в лог-файл
+    logFile.WriteLine Now() & ": " & message & "<br>"
+
+    ' Закрываем лог-файл
+    logFile.Close
+
+    ' Освобождаем ресурсы
+    Set logFile = Nothing
+    Set fso = Nothing
+End Sub
+
+
+' Основные процедуры (расположены в логическом порядке)
+
+'''
+' Подпрограмма: OpenDatabases
+' Описание:  Устанавливает соединение с текущей базой данных и инициализирует словарь для хранения полей таблиц.
+'
+' Примечания:
+'   Предполагается, что строки подключения (strPostgresSQLConnectionString, strPostgresToSQLConnectionString)
+'   и информация о полях таблиц (dictTableFieldsByTable) уже загружены или будут загружены из другого места.
+'
+' Пример:
+'   OpenDatabases 'Вызов при старте приложения
+'''
+Sub OpenDatabases()
+    ' Открываем текущую базу данных
+    Set dbCurrent = CurrentDb()                                   '  Устанавливаем ссылку на текущую базу данных
+
+    ' Инициализируем словарь, хранящий поля таблиц
+    Set dictTableFieldsByTable = CreateObject("Scripting.Dictionary")     '  Создаем экземпляр словаря для хранения полей таблиц
+
+    ' Здесь можно добавить код для заполнения dictTableFieldsByTable (например, из другой процедуры)
+    ' Или для загрузки строк подключения. Предположим, что строки подключения уже загружены из других источников.
+    ' strPostgresSQLConnectionString = "..."
+    ' strPostgresToSQLConnectionString = "..."
+    ' Заполнение dictTableFieldsByTable может быть выполнено в другой подпрограмме
+    ' или при загрузке формы.
+End Sub
+
+'''
+' Функция: MarkNoField
+' Описание:  Помечает записи в таблице DataImport как "NO_FIELD", если соответствующие поля отсутствуют в целевой базе данных PostgreSQL.
+'
+' Аргументы:
+'   Нет. Использует глобальные переменные strPostgresSQLConnectionString, strPostgresToSQLConnectionString и dbCurrent.
+'
+' Примечания:
+'   Использует информацию из таблиц information_schema.columns в базах данных PostgreSQL для определения наличия полей.
+'
+' Пример:
+'   MarkNoField 'Вызов после загрузки данных в DataImport
+'''
+Function MarkNoField()
+    Dim rstDataImportTables As DAO.Recordset                 ' Набор записей с именами таблиц из DataImport
+    Dim rstPostgresFields As DAO.Recordset                   ' Набор записей с именами полей из PostgreSQL (источник)
+    Dim rstPostgresToFields As DAO.Recordset                 ' Набор записей с именами полей из PostgreSQL (назначение)
+    Dim qdfPostgres As DAO.QueryDef                          ' Объект QueryDef для подключения к PostgreSQL (источник)
+    Dim qdfPostgresTo As DAO.QueryDef                        ' Объект QueryDef для подключения к PostgreSQL (назначение)
+    Dim strSQL As String                                     ' Строка SQL запроса
+    Dim strTableName As String                               ' Имя таблицы
+    Dim strFieldName As String                               ' Имя поля
+    Dim dictPostgresFields As Object                         ' Словарь для хранения полей PostgreSQL (источник)
+    Dim dictPostgresToFields As Object                       ' Словарь для хранения полей PostgreSQL (назначение)
+
+    ' Открываем набор записей с именами таблиц из DataImport
+    strSQL = "SELECT DISTINCT TableName FROM DataImport"
+    Set rstDataImportTables = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    ' Создаем объекты QueryDef для подключения к PostgreSQL
+    Set qdfPostgres = dbCurrent.CreateQueryDef("")                '  Создаем QueryDef для подключения к PostgreSQL (источник)
+    Set qdfPostgresTo = dbCurrent.CreateQueryDef("")              '  Создаем QueryDef для подключения к PostgreSQL (назначение)
+
+    ' Проверяем, что набор записей не пуст
+    If Not rstDataImportTables.EOF Then
+        ' Цикл по именам таблиц
+        Do While Not rstDataImportTables.EOF
+            ' Получаем имя таблицы и преобразуем его в нижний регистр
+            strTableName = LCase(rstDataImportTables!TableName)    '  Получаем имя таблицы
+
+            ' Настраиваем подключение qdfPostgres к базе данных PostgreSQL (источник)
+            qdfPostgres.Connect = strPostgresSQLConnectionString  '  Устанавливаем строку подключения к PostgreSQL (источник)
+            
+            ' Формируем SQL запрос для получения имен полей из PostgreSQL (источник)
+            strSQL = "SELECT column_name FROM information_schema.columns WHERE table_name = '" & strTableName & "'"
+            qdfPostgres.SQL = strSQL                                '  Задаем SQL запрос для получения полей таблицы
+
+            ' Открываем набор записей с именами полей из PostgreSQL (источник)
+            Set rstPostgresFields = qdfPostgres.OpenRecordset(dbOpenSnapshot, dbReadOnly)    ' Открываем набор записей с именами полей
+
+            ' Создаем словарь для хранения полей PostgreSQL (источник)
+            Set dictPostgresFields = CreateObject("Scripting.Dictionary")  ' Создаем словарь для хранения полей
+
+            ' Заполняем словарь именами полей
+            If Not rstPostgresFields.EOF Then
+                Do While Not rstPostgresFields.EOF
+                    strFieldName = rstPostgresFields!column_name           '  Получаем имя поля
+                    dictPostgresFields(strFieldName) = True                '  Добавляем поле в словарь
+                    rstPostgresFields.MoveNext
+                Loop
+            End If
+            
+            ' Настраиваем подключение qdfPostgresTo к базе данных PostgreSQL (назначение)
+            qdfPostgresTo.Connect = strPostgresToSQLConnectionString      '  Устанавливаем строку подключения к PostgreSQL (назначение)
+            
+            ' Формируем SQL запрос для получения имен полей из PostgreSQL (назначение)
+            strSQL = "SELECT column_name FROM information_schema.columns WHERE table_name = '" & strTableName & "'"
+            qdfPostgresTo.SQL = strSQL                                    '  Задаем SQL запрос для получения полей таблицы
+
+            ' Открываем набор записей с именами полей из PostgreSQL (назначение)
+            Set rstPostgresToFields = qdfPostgresTo.OpenRecordset(dbOpenSnapshot, dbReadOnly)    ' Открываем набор записей с именами полей
+
+            ' Создаем словарь для хранения полей PostgreSQL (назначение)
+            Set dictPostgresToFields = CreateObject("Scripting.Dictionary")  ' Создаем словарь для хранения полей
+
+            ' Заполняем словарь именами полей
+            If Not rstPostgresToFields.EOF Then
+                Do While Not rstPostgresToFields.EOF
+                    strFieldName = rstPostgresToFields!column_name           '  Получаем имя поля
+                    dictPostgresToFields(strFieldName) = True                '  Добавляем поле в словарь
+                    rstPostgresToFields.MoveNext
+                Loop
+            End If
+
+            ' Закрываем rstPostgresToFields и освобождаем объект
+            rstPostgresToFields.Close
+            Set rstPostgresToFields = Nothing
+
+            ' Итерируемся по полям dictPostgresToFields и сравниваем их с dictPostgresFields
+            For Each strFieldName In dictPostgresToFields.Keys
+                ' Если поле отсутствует в dictPostgresFields, помечаем его как 'NO_FIELD'
+                If Not dictPostgresFields.Exists(strFieldName) Then
+                    strSQL = "UPDATE DataImport SET DataMark = 'NO_FIELD' WHERE TableName = '" & strTableName & "' AND FieldName = '" & strFieldName & "'"
+                    dbCurrent.Execute strSQL, dbFailOnError
+                End If
+            Next strFieldName
+
+            ' Освобождаем объекты и закрываем подключения
+            Set dictPostgresFields = Nothing
+            Set dictPostgresToFields = Nothing
+            rstPostgresFields.Close
+            Set rstPostgresFields = Nothing
+            
+            ' Переходим к следующей таблице
+            rstDataImportTables.MoveNext
+        Loop
+    End If
+
+    ' Закрываем rstDataImportTables и освобождаем объект
+    rstDataImportTables.Close
+    Set rstDataImportTables = Nothing
+
+    ' Освобождаем объекты QueryDef
+    Set qdfPostgres = Nothing
+    Set qdfPostgresTo = Nothing
+
+    ' Записываем сообщение в лог
+    LogMessage "Завершено: Пометка отсутствующих полей (PostgreSQL)"
+
+End Function
+
+'''
+' Подпрограмма: SetIsFinalImport
+' Описание:  Устанавливает флаг IsFinalImport в TRUE для определенных записей в таблице DataImport.
+'
+' Критерии установки флага:
+'   1. Для записей с DataMark = 'UNIQUE'.
+'   2. Для записей с FieldName = 'status' и DataMark = 'DIFFERENCE'.
+'
+' Аргументы:
+'   Нет.  Использует глобальную переменную dbCurrent.
+'
+' Пример:
+'   SetIsFinalImport 'Вызывается после MarkNoField для подготовки данных к импорту.
+'''
+Sub SetIsFinalImport()
+    Dim rstDataImport As DAO.Recordset                         ' Набор записей из DataImport
+    Dim rstStatusDifference As DAO.Recordset                   ' Набор записей для статусов с DataMark = 'DIFFERENCE'
+    Dim strSQL As String                                       ' Строка SQL запроса
+    Dim intRecordID As Long                                    ' ID записи
+    Dim strTableName As String                                 ' Имя таблицы
+
+    ' Устанавливаем IsFinalImport = TRUE для записей с DataMark = 'UNIQUE'
+    strSQL = "SELECT DISTINCT ID, TableName FROM DataImport WHERE DataMark = 'UNIQUE' ORDER BY TableName,ID"
+    Set rstDataImport = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    If Not rstDataImport.EOF Then
+        Do While Not rstDataImport.EOF
+            intRecordID = rstDataImport!ID                     '  Получаем ID записи
+            strTableName = rstDataImport!TableName              '  Получаем имя таблицы
+
+            strSQL = "UPDATE DataImport SET IsFinalImport = TRUE " & _
+                     "WHERE ID = " & intRecordID & " AND TableName = '" & strTableName & "' AND EXISTS " & _
+                     "(SELECT 1 FROM DataImport WHERE DataMark = 'UNIQUE' AND ID = " & intRecordID & " AND TableName = '" & strTableName & "')"
+            dbCurrent.Execute strSQL, dbFailOnError
+
+            rstDataImport.MoveNext
+        Loop
+    End If
+
+    ' Закрываем rstDataImport и освобождаем объект
+    rstDataImport.Close
+    Set rstDataImport = Nothing
+
+    ' Устанавливаем IsFinalImport = TRUE для записей с FieldName = 'status' и DataMark = 'DIFFERENCE'
+    strSQL = "SELECT DISTINCT ID, TableName FROM DataImport WHERE FieldName = 'status' AND DataMark = 'DIFFERENCE'"
+    Set rstStatusDifference = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    If Not rstStatusDifference.EOF Then
+        Do While Not rstStatusDifference.EOF
+            intRecordID = rstStatusDifference!ID                '  Получаем ID записи
+            strTableName = rstStatusDifference!TableName         '  Получаем имя таблицы
+
+            strSQL = "UPDATE DataImport SET IsFinalImport = TRUE " & _
+                     "WHERE ID = " & intRecordID & " AND TableName = '" & strTableName & "' AND FieldName = 'status' AND DataMark = 'DIFFERENCE'"
+            dbCurrent.Execute strSQL, dbFailOnError
+
+            rstStatusDifference.MoveNext
+        Loop
+    End If
+
+    ' Закрываем rstStatusDifference и освобождаем объект
+    rstStatusDifference.Close
+    Set rstStatusDifference = Nothing
+
+    ' Записываем сообщение в лог
+    LogMessage "Завершено: Проставление IsFinalImport = TRUE для UNIQUE записей"
+
+End Sub
+
+'''
+' Подпрограмма: RegenerateIDsForLinkedTables
+' Описание:  Перегенерирует значения ID для связанных таблиц, используя функцию GenerateIDUniversal.
+'            Обновляет значения DataFrom в DataImport и связанных таблицах через TableConnect.
+'
+' Аргументы:
+'   Нет.  Использует глобальную переменную dbCurrent.
+'
+' Примечания:
+'   Использует таблицу TableConnect для определения связей между таблицами.
+'   Функция ID_generate.GenerateIDUniversal должна быть определена в другом модуле.
+'
+' Пример:
+'   RegenerateIDsForLinkedTables 'Вызывается после SetIsFinalImport перед импортом данных
+'''
+Sub RegenerateIDsForLinkedTables()
+    Dim rstTableNames As DAO.Recordset                         ' Набор записей с именами таблиц, для которых нужно перегенерировать ID
+    Dim rstTableFields As DAO.Recordset                        ' Набор записей с информацией о полях таблицы
+    Dim rstDataImport As DAO.Recordset                         ' Набор записей из DataImport
+    Dim rstTableConnect As DAO.Recordset                       ' Набор записей с информацией о связях таблиц
+    Dim strSQL As String                                       ' Строка SQL запроса
+    Dim strTableName As String                                 ' Имя таблицы
+    Dim strFieldNameID As String                               ' Имя поля ID
+    Dim strDataFromOriginal As String                          ' Исходное значение DataFrom
+    Dim strDataFromNew As String                               ' Новое значение DataFrom
+    Dim strTableFrom As String                                 ' Имя таблицы-источника
+    Dim strFieldFrom As String                                 ' Имя поля-источника
+    Dim strConnectString As String                             ' Строка подключения (не используется, но сохранена для соответствия исходному коду)
+    Dim intTableCount As Long                                  ' Счетчик для генерации уникальных ID
+    Dim strTableCountName As String                            ' Имя таблицы, для которой ведется подсчет
+
+    intTableCount = 0                                          '  Инициализируем счетчик
+    strTableCountName = ""                                     '  Инициализируем имя таблицы
+
+    ' Получаем список уникальных имен таблиц, для которых IsFinalImport = TRUE
+    strSQL = "SELECT DISTINCT TableName FROM DataImport WHERE IsFinalImport = TRUE"
+    Set rstTableNames = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    ' Проверяем, что набор записей не пуст
+    If Not rstTableNames.EOF Then
+        Do While Not rstTableNames.EOF
+            strTableName = rstTableNames!TableName             '  Получаем имя таблицы
+
+            ' Получаем имя поля ID для текущей таблицы
+            strSQL = "SELECT FieldName FROM TableFields WHERE TableName = '" & strTableName & "' AND TypeField = 'ID'"
+            Set rstTableFields = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+            ' Проверяем, что поле ID найдено
+            If Not rstTableFields.EOF Then
+                strFieldNameID = rstTableFields!fieldName        '  Получаем имя поля ID
+                rstTableFields.Close                             ' Закрываем rstTableFields
+                Set rstTableFields = Nothing                     ' Освобождаем rstTableFields
+
+                ' Получаем исходные значения DataFrom для текущей таблицы и поля ID
+                strSQL = "SELECT DataFrom FROM DataImport WHERE TableName = '" & strTableName & "' AND IsFinalImport = TRUE AND FieldName = '" & strFieldNameID & "'"
+                Set rstDataImport = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+                ' Проверяем, что набор записей не пуст
+                If Not rstDataImport.EOF Then
+                    Do While Not rstDataImport.EOF
+                        strDataFromOriginal = rstDataImport!DataFrom  '  Получаем исходное значение DataFrom
+
+                        ' Если имя текущей таблицы не равно имени предыдущей, сбрасываем счетчик
+                        If strTableName <> strTableCountName Then
+                            intTableCount = 0
+                            strTableCountName = strTableName
+                        End If
+
+                        ' Генерируем новое значение ID
+                        strDataFromNew = ID_generate.GenerateIDUniversal(Environ("username"), strTableName, Null)
+                        strDataFromNew = strDataFromNew & intTableCount
+                        intTableCount = intTableCount + 1
+
+                        ' Обновляем DataFrom в DataImport для текущей таблицы
+                        strSQL = "UPDATE DataImport SET DataFrom = '" & strDataFromNew & "' " & _
+                                 "WHERE TableName = '" & strTableName & "' AND IsFinalImport = TRUE AND FieldName = '" & strFieldNameID & "' AND DataFrom = '" & strDataFromOriginal & "'"
+                        dbCurrent.Execute strSQL, dbFailOnError
+
+                        ' Получаем информацию о связях таблиц
+                        strSQL = "SELECT TableFrom, FieldFrom FROM TableConnect WHERE TableTo = '" & strTableName & "'"
+                        Set rstTableConnect = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+                        ' Если есть связанные таблицы, обновляем значения DataFrom
+                        If Not rstTableConnect.EOF Then
+                            Do While Not rstTableConnect.EOF
+                                strTableFrom = rstTableConnect!TableFrom      ' Имя таблицы-источника
+                                strFieldFrom = rstTableConnect!FieldFrom      ' Имя поля-источника
+
+                                ' Обновляем DataFrom в связанных таблицах
+                                strSQL = "UPDATE DataImport SET DataFrom = '" & strDataFromNew & "' " & _
+                                         "WHERE TableName = '" & strTableFrom & "' AND FieldName = '" & strFieldFrom & "' AND DataFrom = '" & strDataFromOriginal & "' AND IsFinalImport = TRUE"
+                                dbCurrent.Execute strSQL, dbFailOnError
+
+                                rstTableConnect.MoveNext                     ' Переходим к следующей записи в rstTableConnect
+                            Loop
+                        End If
+
+                        ' Закрываем rstTableConnect и освобождаем объект
+                        rstTableConnect.Close
+                        Set rstTableConnect = Nothing
+
+                        rstDataImport.MoveNext                             ' Переходим к следующей записи в rstDataImport
+                    Loop
+                End If
+
+                ' Закрываем rstDataImport и освобождаем объект
+                rstDataImport.Close
+                Set rstDataImport = Nothing
+
+            Else
+                ' Если поле ID не найдено, закрываем rstTableFields и освобождаем объект
+                rstTableFields.Close
+                Set rstTableFields = Nothing
+            End If
+
+            rstTableNames.MoveNext                                   ' Переходим к следующей записи в rstTableNames
+        Loop
+    End If
+
+    ' Закрываем rstTableNames и освобождаем объект
+    rstTableNames.Close
+    Set rstTableNames = Nothing
+
+    ' Записываем сообщение в лог
+    LogMessage "Завершено: RegenerateIDsForLinkedTables"
+
+End Sub
+
+
+'''
+' Подпрограмма: ImportFinalData
+' Описание:  Импортирует окончательные данные из таблицы DataImport в целевые таблицы базы данных.
+'
+' Алгоритм:
+'  1. Выбирает уникальные комбинации ID и TableName из DataImport, где IsFinalImport = TRUE.
+'  2. Для каждой комбинации:
+'   - Составляет SQL-запрос INSERT на основе данных из DataImport.
+'   - Выполняет INSERT запрос для добавления новых записей в целевую таблицу.
+'   - Обновляет DataImport, устанавливая IsFinalImport = FALSE для обработанных записей.
+'
+' Если DataMark = 'DIFFERENCE', выполняет UPDATE существующих записей вместо INSERT.
+'
+' Аргументы:
+'   Нет. Использует глобальные переменные dbCurrent и DLookup.
+'
+' Пример:
+'   ImportFinalData ' Вызывается для переноса данных после всех проверок и преобразований.
+'''
+Sub ImportFinalData()
+    Dim rstDistinctIDs As DAO.Recordset                         ' Набор записей с уникальными ID и именами таблиц
+    Dim rstDataImport As DAO.Recordset                         ' Набор записей с данными для импорта
+    Dim rstTableFields As DAO.Recordset                        ' Набор записей с информацией о полях таблицы
+    Dim strSQL As String                                       ' Строка SQL запроса
+    Dim strTableName As String                                 ' Имя таблицы
+    Dim strFieldName As String                                 ' Имя поля
+    Dim strTypeField As String                                 ' Тип поля
+    Dim varDataFrom As Variant                                 ' Значение DataFrom
+    Dim strDataTo As String                                    ' Значение DataTo
+    Dim strFieldNameList As String                             ' Список имен полей для запроса INSERT
+    Dim strDataFromList As String                              ' Список значений полей для запроса INSERT
+    Dim intID As Long                                          ' ID записи
+    Dim strInsertSQL As String                                 ' Строка SQL запроса INSERT
+    Dim strUpdateSQL As String                                 ' Строка SQL запроса UPDATE
+    Dim blnInsert As Boolean                                   ' Флаг, указывающий, нужно ли выполнять INSERT
+    Dim strUpdateClause As String                              ' Часть запроса UPDATE (SET ...)
+    Dim strWhereClause As String                              ' Часть запроса UPDATE (WHERE ...)
+    Dim fld As DAO.Field                                       ' Объект Field (не используется, но остался из исходного кода)
+    Dim strWhoUpdater As String                                ' Имя пользователя, выполнившего обновление
+
+    strWhoUpdater = DLookup("fio_kratk", "tbfio", "netfio = '" & Environ("username") & "'") ' Получаем имя пользователя
+
+    ' Получаем уникальные ID и имена таблиц для записей с isfinalimport = TRUE
+    strSQL = "SELECT DISTINCT ID, TableName FROM DataImport WHERE isfinalimport = TRUE ORDER BY TableName, ID"
+    Set rstDistinctIDs = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    ' Проверяем, что набор записей не пуст
+    If Not rstDistinctIDs.EOF Then
+        Do While Not rstDistinctIDs.EOF
+            intID = rstDistinctIDs!ID                             '  Получаем ID записи
+            strTableName = rstDistinctIDs!TableName                 '  Получаем имя таблицы
+            strFieldNameList = ""                                 ' Инициализируем список имен полей
+            strDataFromList = ""                                  ' Инициализируем список значений полей
+
+            ' Получаем информацию о полях для текущей записи (ID и TableName)
+            strSQL = "SELECT FieldName, TypeField, DataFrom FROM DataImport WHERE ID = " & intID & " AND TableName = '" & strTableName & _
+                     "'AND DataMark NOT IN ('NO_FIELD')"
+            Set rstDataImport = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+            ' Проверяем, что набор записей не пуст
+            If Not rstDataImport.EOF Then
+                Do While Not rstDataImport.EOF
+                    strFieldName = rstDataImport!fieldName            '  Получаем имя поля
+                    strTypeField = rstDataImport!TypeField            '  Получаем тип поля
+                    varDataFrom = rstDataImport!DataFrom              '  Получаем значение DataFrom
+
+                    ' Формируем список имен полей и значений для запроса INSERT
+                    If strFieldNameList <> "" Then
+                        strFieldNameList = strFieldNameList & ", "
+                        strDataFromList = strDataFromList & ", "
+                    End If
+                    strFieldNameList = strFieldNameList & "[" & strFieldName & "]"
+
+                    ' Обрабатываем значение DataFrom в зависимости от типа поля
+                    If IsNull(varDataFrom) Or varDataFrom = "NULL" Then
+                        strDataFromList = strDataFromList & "NULL"
+                    Else
+                        If Len(CStr(varDataFrom)) >= 50 Then
+                            varDataFrom = DivideText(CStr(varDataFrom), 50) ' Разбиваем длинные строки
+                        End If
+                        Select Case strTypeField
+                            Case "VAR", "MEMO"
+                                strDataFromList = strDataFromList & "'" & Replace(Replace(CStr(varDataFrom), "'", "''"), "'' & ''", "' & '") & "'" ' Экранируем кавычки и заменяем "'' & ''"
+                            Case "INT", "NUMERIC"
+                                strDataFromList = strDataFromList & CStr(varDataFrom) ' Преобразуем в строку
+                            Case "DATE"
+                                strDataFromList = strDataFromList & SwapDayMonth(CStr(varDataFrom)) ' Меняем формат даты
+                            Case Else
+                                strDataFromList = strDataFromList & "'" & Replace(Replace(CStr(varDataFrom), "'", "''"), "'' & ''", "' & '") & "'" ' Экранируем кавычки
+                        End Select
+                    End If
+
+                    rstDataImport.MoveNext                                 ' Переходим к следующей записи
+                Loop
+
+                ' Добавляем поля date_update и whoupdater в список полей и значений для запроса INSERT
+                strFieldNameList = strFieldNameList & ", [date_update], [whoupdater]"
+                strDataFromList = strDataFromList & ", NOW(), '" & strWhoUpdater & "'"
+
+                ' Формируем запрос INSERT
+                strInsertSQL = "INSERT INTO [" & strTableName & "] (" & strFieldNameList & ") VALUES (" & strDataFromList & ")"
+                dbCurrent.Execute strInsertSQL, dbFailOnError             ' Выполняем запрос INSERT
+
+                ' Устанавливаем IsFinalImport = False для обработанной записи
+                strSQL = "UPDATE DataImport SET IsFinalImport = False WHERE ID = " & intID & _
+                         " AND TableName = '" & strTableName & "'"
+                dbCurrent.Execute strSQL, dbFailOnError                  ' Выполняем запрос UPDATE
+            End If
+
+            ' Закрываем rstDataImport и освобождаем объект
+            rstDataImport.Close
+            Set rstDataImport = Nothing
+
+            rstDistinctIDs.MoveNext                                    ' Переходим к следующей записи
+        Loop
+    End If
+
+    ' Закрываем rstDistinctIDs и освобождаем объект
+    rstDistinctIDs.Close
+    Set rstDistinctIDs = Nothing
+
+    ' Получаем записи с DataMark = 'DIFFERENCE' и isfinalimport = TRUE для обновления
+    strSQL = "SELECT DISTINCT ID, TableName FROM DataImport WHERE DataMark = 'DIFFERENCE' AND isfinalimport = TRUE ORDER BY TableName, ID"
+    Set rstDistinctIDs = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+    ' Проверяем, что набор записей не пуст
+    If Not rstDistinctIDs.EOF Then
+        Do While Not rstDistinctIDs.EOF
+            intID = rstDistinctIDs!ID                                     '  Получаем ID записи
+            strTableName = rstDistinctIDs!TableName                         '  Получаем имя таблицы
+            blnInsert = True                                               ' Флаг для определения, нужно ли выполнять INSERT
+            strFieldNameList = ""                                          ' Инициализируем список имен полей для запроса INSERT (не используется в этом блоке, но оставлен)
+            strDataFromList = ""                                           ' Инициализируем список значений полей для запроса INSERT (не используется в этом блоке, но оставлен)
+            strUpdateClause = ""                                           ' Инициализируем часть запроса UPDATE (SET ...)
+            strWhereClause = ""                                            ' Инициализируем часть запроса UPDATE (WHERE ...)
+
+            ' Проверяем, есть ли у таблицы поле с типом ID
+            strSQL = "SELECT FieldName FROM TableFields WHERE TableName = '" & strTableName & "' AND TypeField = 'ID'"
+            Set rstTableFields = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+            If Not rstTableFields.EOF Then
+                blnInsert = True
+            Else
+                blnInsert = False
+            End If
+            rstTableFields.Close
+            Set rstTableFields = Nothing
+
+            ' Если нужно выполнять обновление (т.е., нет поля ID в TableFields)
+            If blnInsert Then
+                ' Получаем информацию о полях для обновления
+                strSQL = "SELECT FieldName, TypeField, DataFrom FROM DataImport WHERE ID = " & intID & _
+                         " AND TableName = '" & strTableName & "'AND DataMark NOT IN ('NO_FIELD')"
+                Set rstDataImport = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+                ' Проверяем, что набор записей не пуст
+                If Not rstDataImport.EOF Then
+                    Do While Not rstDataImport.EOF
+                        strFieldName = rstDataImport!fieldName                '  Получаем имя поля
+                        strTypeField = rstDataImport!TypeField                '  Получаем тип поля
+                        strDataFrom = rstDataImport!DataFrom                  '  Получаем значение DataFrom
+
+                        ' Формируем часть запроса UPDATE (SET ...)
+                        If rstDataImport!DataMark = "DIFFERENCE" And rstDataImport!IsFinalImport = True Then
+                            If strUpdateClause <> "" Then
+                                strUpdateClause = strUpdateClause & ", "
+                            End If
+
+                            If IsNull(strDataFrom) Or strDataFrom = "NULL" Then
+                                strUpdateClause = strUpdateClause & "[" & strFieldName & "] = NULL" ' Устанавливаем NULL
+                            Else
+                                If Len(strDataFrom) >= 50 Then
+                                    strDataFrom = DivideText(strDataFrom, 50) ' Разбиваем длинные строки
+                                End If
+
+                                Select Case strTypeField
+                                    Case "VAR", "MEMO"
+                                        strUpdateClause = strUpdateClause & "[" & strFieldName & "] = '" & Replace(Replace(strDataFrom, "'", "''"), "'' & ''", "' & '") & "'" ' Экранируем кавычки
+                                    Case "INT", "NUMERIC"
+                                        strUpdateClause = strUpdateClause & "[" & strFieldName & "] = " & strDataFrom ' Преобразуем в строку
+                                    Case "DATE"
+                                        strUpdateClause = strUpdateClause & "[" & strFieldName & "] = " & SwapDayMonth(strDataFrom) ' Меняем формат даты
+                                    Case Else
+                                        strUpdateClause = strUpdateClause & "[" & strFieldName & "] = '" & Replace(Replace(strDataFrom, "'", "''"), "'' & ''", "' & '") & "'" ' Экранируем кавычки
+                                End Select
+                            End If
+                        End If
+
+                        rstDataImport.MoveNext                                 ' Переходим к следующей записи
+                    Loop
+                    
+                    'Обновляем строку, после того как прошел цикл
+
+                     rstDataImport.MoveFirst                               ' Переходим к первой записи для перезаписи значений
+
+                     strUpdateClause = strUpdateClause & ", [date_update] = NOW(), [whoupdater] = '" & strWhoUpdater & "'" ' Добавляем date_update и whoupdater
+
+                    ' Выполняем запрос UPDATE
+                    strUpdateSQL = "UPDATE [" & strTableName & "] SET " & strUpdateClause & " WHERE " & strWhereClause
+                    dbCurrent.Execute strUpdateSQL, dbFailOnError
+
+                    ' Устанавливаем IsFinalImport = False
+                    strSQL = "UPDATE DataImport SET IsFinalImport = False WHERE ID = " & intID & _
+                             " AND TableName = '" & strTableName & "'"
+                    dbCurrent.Execute strSQL, dbFailOnError
+                End If
+
+                ' Закрываем rstDataImport и освобождаем объект
+                rstDataImport.Close
+                Set rstDataImport = Nothing
+            Else
+                ' Если не нужно выполнять INSERT, получаем информацию о полях для обновления
+                strSQL = "SELECT TableName, FieldName, TypeField, DataFrom, DataTo, DataMark, IsFinalImport FROM DataImport WHERE ID = " & intID & _
+                         " AND TableName = '" & strTableName & "'AND DataMark NOT IN ('NO_FIELD')"
+
+                Set rstDataImport = dbCurrent.OpenRecordset(strSQL, dbOpenSnapshot)
+
+                If Not rstDataImport.EOF Then
+                    Do While Not rstDataImport.EOF
+                        strFieldName = rstDataImport!fieldName                '  Получаем имя поля
+                        strTypeField = rstDataImport!TypeField                '  Получаем тип поля
+                        strDataTo = rstDataImport!DataTo                      '  Получаем значение DataTo
+
+                        ' Формируем часть запроса UPDATE (WHERE ...) для UNIQUE_NO_COMPARE
+                        If rstDataImport!DataMark = "UNIQUE_NO_COMPARE" Then
+                            If strWhereClause <> "" Then
+                                strWhereClause = strWhereClause & " AND "
+                            End If
+
+                            If IsNull(strDataTo) Or strDataTo = "NULL" Then
+                                strWhereClause = strWhereClause & "[" & strFieldName & "] = NULL"
+                            Else
+                                If Len(strDataTo) >= 50 Then
+                                    strDataTo = DivideText(strDataTo, 50) ' Разбиваем длинные строки
+                                End If
+
+                                Select Case strTypeField
+                                    Case "VAR", "MEMO"
+                                        strWhereClause = strWhereClause & "[" & strFieldName & "] = '" & Replace(Replace(strDataTo, "'", "''"), "'' & ''", "' & '") & "'"
+                                    Case "INT", "NUMERIC"
+                                        strWhereClause = strWhereClause & "[" & strFieldName & "] = " & strDataTo
+                                    Case "DATE"
+                                        strWhereClause = strWhereClause & "[" & strFieldName & "] = " & SwapDayMonth(strDataTo)
+                                    Case Else
+                                        strWhereClause = strWhereClause & "[" & strFieldName & "] = '" & Replace(Replace(strDataTo, "'", "''"), "'' & ''", "' & '") & "'"
+                                End Select
+                            End If
+                        End If
+                         rstDataImport.MoveNext                                 ' Переходим к следующей записи
+                    Loop
+                    'Если strWhereClause  пустая то пропускаем
+                    If Len(strWhereClause) > 0 Then
+
+                        'strUpdateSQL = "UPDATE [" & strTableName & "] SET " & strUpdateClause & " WHERE " & strWhereClause
+                       'Если strUpdateClause  пустая то пропускаем
+                        If Len(strUpdateClause) > 0 Then
+                            strUpdateSQL = "UPDATE [" & strTableName & "] SET " & strUpdateClause & " WHERE " & strWhereClause
+                            dbCurrent.Execute strUpdateSQL, dbFailOnError
+                        End If
+
+                    End If
+                    
+                    strSQL = "UPDATE DataImport SET IsFinalImport = False WHERE ID = " & intID & _
+                             " AND TableName = '" & strTableName & "'"
+                    dbCurrent.Execute strSQL, dbFailOnError
+                End If
+
+                ' Закрываем rstDataImport и освобождаем объект
+                rstDataImport.Close
+                Set rstDataImport = Nothing
+            End If
+            rstDistinctIDs.MoveNext                                    ' Переходим к следующей записи
+        Loop
+    End If
+
+    ' Закрываем rstDistinctIDs и освобождаем объект
+    rstDistinctIDs.Close
+    Set rstDistinctIDs = Nothing
+
+    ' Освобождаем объект базы данных
+    Set dbCurrent = Nothing
+
+    ' Записываем сообщение в лог
+    LogMessage "Завершено: ImportFinalData"
+End Sub
+
+'''
+' Подпрограмма: ClearLogFile
+' Описание:  Очищает лог-файл и таблицу DataImport.
+'
+' Аргументы:
+'   Нет. Использует глобальную переменную dbCurrent.
+'
+' Пример:
+'   ClearLogFile ' Вызывается для очистки лога и таблицы DataImport.
+'''
+Sub ClearLogFile()
+    Dim fso As Object                                   ' Объект FileSystemObject для работы с файловой системой
+    Dim ts As Object                                    ' Объект TextStream для записи в текстовый файл
+
+    Dim strFilePath As String                           ' Полный путь к лог-файлу
+    Dim strSQL As String                                ' Строка SQL запроса
+
+    strFilePath = CurrentProject.Path & "\MigrationLog.html" ' Формируем путь к лог-файлу
+
+    ' Создаем объект FileSystemObject
+    Set fso = CreateObject("Scripting.FileSystemObject")
+
+    ' Проверяем существование файла
+    If fso.FileExists(strFilePath) Then
+        ' Создаем (или перезаписываем) текстовый файл
+        Set ts = fso.CreateTextFile(strFilePath, True)
+
+        ' Записываем HTML-заголовок в файл
+        ts.WriteLine "<html><head><meta hhtp-equiv='refresh' content='5'></head><body>"
+
+        ' Закрываем файл
+        ts.Close
+        Set ts = Nothing
+    End If
+    Set fso = Nothing
+
+    ' Открываем соединение с базой данных
+    OpenDatabases
+
+    ' Формируем и выполняем SQL запрос для очистки таблицы DataImport
+    strSQL = "DELETE FROM DataImport"
+    dbCurrent.Execute strSQL, dbFailOnError
+
+    ' Записываем сообщение в лог
+    LogMessage "Таблица DataImport очищена"
+
+End Sub
