@@ -1,0 +1,340 @@
+Option Explicit
+
+' Модуль: Содержит функции и подпрограммы для подключения к базе данных PostgreSQL и управления связанными таблицами и запросами.
+' Автор: [ZeRoN]
+' Дата создания: [17.11.2024]
+' Дата изменения: [28.01.2025]
+
+
+'''
+' Функция: QueryDefExists
+' Описание: Проверяет, существует ли указанный запрос (QueryDef) в текущей базе данных.
+'
+' Аргументы:
+'   queryName (String): Имя запроса для проверки.
+'
+' Возвращает:
+'   Boolean: True, если запрос существует; False в противном случае.
+'''
+Function QueryDefExists(ByVal queryName As String) As Boolean
+    Dim qdf As DAO.QueryDef                           ' Объект QueryDef
+
+    On Error Resume Next                                ' Обработка ошибок: продолжаем выполнение при возникновении ошибки
+    Set qdf = CurrentDb.QueryDefs(queryName)          ' Пытаемся получить ссылку на запрос
+    If Err.Number = 0 Then                              ' Если ошибки не было, значит, запрос существует
+        QueryDefExists = True
+    Else
+        QueryDefExists = False                         ' Иначе запрос не существует
+    End If
+    On Error GoTo 0                                     ' Возвращаем стандартную обработку ошибок
+
+    Set qdf = Nothing                                   ' Освобождаем объект
+End Function
+
+'''
+' Функция: GetTypeBase
+' Описание: Определяет, содержит ли текущая база данных связанные таблицы PostgreSQL.
+'
+' Возвращает:
+'   Boolean: True, если найдена хотя бы одна связанная таблица PostgreSQL; False в противном случае.
+'
+' Примечания:
+'   Функция перебирает все связанные таблицы и ищет строку "Driver=PostgreSQL" в строке подключения.
+'''
+Public Function GetTypeBase() As Boolean
+    Dim db As DAO.Database                           ' Объект базы данных
+    Dim tdf As DAO.TableDef                           ' Объект TableDef (описание таблицы)
+    Dim strTableName As String                        ' Имя таблицы
+    Dim blnPostgreSQLFound As Boolean                ' Флаг, указывающий, найдена ли таблица PostgreSQL
+
+    Set db = CurrentDb                                  ' Устанавливаем ссылку на текущую базу данных
+    blnPostgreSQLFound = False                          ' Инициализируем флаг
+
+    For Each tdf In db.TableDefs                      ' Перебираем все TableDef в базе данных
+        strTableName = tdf.Name                        ' Получаем имя текущей таблицы
+        If InStr(1, tdf.Connect, "Driver=PostgreSQL", vbTextCompare) > 0 Then ' Проверяем, содержит ли строка подключения "Driver=PostgreSQL"
+           blnPostgreSQLFound = True                   ' Если содержит, устанавливаем флаг
+           Exit For                                    ' Выходим из цикла, так как достаточно найти одну таблицу
+        End If
+    Next tdf
+
+    GetTypeBase = blnPostgreSQLFound                    ' Возвращаем значение флага
+    Set db = Nothing                                    ' Освобождаем объект
+End Function
+
+'''
+' Подпрограмма: RenameQueryDef
+' Описание: Переименовывает существующий запрос (QueryDef) в текущей базе данных.
+'
+' Аргументы:
+'   oldName (String): Текущее имя запроса.
+'   newName (String): Новое имя запроса.
+'''
+Sub RenameQueryDef(ByVal oldName As String, ByVal newName As String)
+    CurrentDb.QueryDefs(oldName).Name = newName          ' Переименовываем запрос
+End Sub
+
+'''
+' Подпрограмма: RenameTableDef
+' Описание: Переименовывает существующую таблицу (TableDef) в текущей базе данных.
+'
+' Аргументы:
+'   oldName (String): Текущее имя таблицы.
+'   newName (String): Новое имя таблицы.
+'''
+Sub RenameTableDef(ByVal oldName As String, ByVal newName As String)
+    CurrentDb.TableDefs(oldName).Name = newName          ' Переименовываем таблицу
+End Sub
+
+'''
+' Подпрограмма: AddPrimaryKeyToLinkedTable
+' Описание: Добавляет первичный ключ к связанной таблице PostgreSQL.
+'
+' Аргументы:
+'   viewName (String): Имя связанной таблицы.
+'   strPostgreSQLConnectionString (String): Строка подключения к PostgreSQL.
+'
+' Примечания:
+'   Имя поля первичного ключа берется из таблицы sysQr на основе имени связанной таблицы.
+'''
+Sub AddPrimaryKeyToLinkedTable(ByVal viewName As String, ByVal strPostgreSQLConnectionString As String)
+    Dim rs As DAO.Recordset                           ' Набор записей с информацией о первичном ключе
+    Dim strPrimaryKeyField As String                    ' Имя поля первичного ключа
+    Dim strSQL As String                                ' Строка SQL запроса
+
+    ' Открываем набор записей для получения информации о первичном ключе из таблицы sysQr
+    Set rs = CurrentDb.OpenRecordset("SELECT QrName, QrPK FROM sysQr WHERE QrName = '" & viewName & "'", dbOpenSnapshot)
+
+    ' Если запись найдена
+    If Not rs.EOF Then
+        strPrimaryKeyField = rs!QrPK                   ' Получаем имя поля первичного ключа
+
+        ' Формируем и выполняем SQL запрос для добавления первичного ключа к связанной таблице
+        DoCmd.RunSQL "ALTER TABLE [" & viewName & "] ADD CONSTRAINT PK_" & viewName & " PRIMARY KEY (" & strPrimaryKeyField & ")"
+        rs.MoveNext                                     ' Переходим к следующей записи (хотя в данном случае она должна быть только одна)
+    End If
+
+    rs.Close                                            ' Закрываем набор записей
+    Set rs = Nothing                                    ' Освобождаем объект
+End Sub
+
+'''
+' Подпрограмма: CreateLinkedView_PostgreSQL
+' Описание: Создает связанное представление (Linked View) с базой данных PostgreSQL.
+'
+' Аргументы:
+'   postgreSQLViewName (String): Имя представления в базе данных PostgreSQL.
+'   strPostgreSQLConnectionString (String): Строка подключения к PostgreSQL.
+'''
+Sub CreateLinkedView_PostgreSQL(ByVal postgreSQLViewName As String, ByVal strPostgreSQLConnectionString As String)
+    Dim cdb As DAO.Database                           ' Объект базы данных
+    Dim tbd As DAO.TableDef                           ' Объект TableDef (описание таблицы)
+
+    Set cdb = CurrentDb                                 ' Устанавливаем ссылку на текущую базу данных
+    Set tbd = New DAO.TableDef                          ' Создаем новый объект TableDef
+
+    With tbd                                            ' Устанавливаем свойства TableDef
+        .Connect = strPostgreSQLConnectionString       ' Строка подключения к PostgreSQL
+        .SourceTableName = postgreSQLViewName           ' Имя представления в PostgreSQL
+        .Name = Replace(postgreSQLViewName, ".", "_", 1, -1, vbTextCompare) ' Формируем имя связанной таблицы (заменяем точки на подчеркивания)
+        .Attributes = dbAttachExclusive + dbAttachSavePWD ' Устанавливаем атрибуты (эксклюзивное подключение и сохранение пароля)
+    End With
+
+    cdb.TableDefs.Append tbd                            ' Добавляем TableDef в коллекцию TableDefs
+    Set tbd = Nothing                                   ' Освобождаем объект
+    Set cdb = Nothing                                   ' Освобождаем объект
+End Sub
+
+'''
+' Подпрограмма: CreateLinkedTable_PostgreSQL
+' Описание: Создает связанную таблицу с базой данных PostgreSQL.
+'
+' Аргументы:
+'   postgreSQLTableName (String): Имя таблицы в базе данных PostgreSQL.
+'   strPostgreSQLConnectionString (String): Строка подключения к PostgreSQL.
+'''
+Sub CreateLinkedTable_PostgreSQL(ByVal postgreSQLTableName As String, ByVal strPostgreSQLConnectionString As String)
+    Dim cdb As DAO.Database                           ' Объект базы данных
+    Dim tbd As DAO.TableDef                           ' Объект TableDef (описание таблицы)
+
+    Set cdb = CurrentDb                                 ' Устанавливаем ссылку на текущую базу данных
+    Set tbd = New DAO.TableDef                          ' Создаем новый объект TableDef
+
+    With tbd                                            ' Устанавливаем свойства TableDef
+        .Connect = strPostgreSQLConnectionString       ' Строка подключения к PostgreSQL
+        .SourceTableName = postgreSQLTableName           ' Имя таблицы в PostgreSQL
+        .Name = Replace(postgreSQLTableName, ".", "_", 1, -1, vbTextCompare) ' Формируем имя связанной таблицы (заменяем точки на подчеркивания)
+        .Attributes = dbAttachExclusive + dbAttachSavePWD ' Устанавливаем атрибуты (эксклюзивное подключение и сохранение пароля)
+    End With
+
+    cdb.TableDefs.Append tbd                            ' Добавляем TableDef в коллекцию TableDefs
+    Set tbd = Nothing                                   ' Освобождаем объект
+    Set cdb = Nothing                                   ' Освобождаем объект
+End Sub
+
+'''
+' Подпрограмма: Unlink_Tables
+' Описание: Удаляет все связанные таблицы и запросы, подключенные к внешним источникам данных, из текущей базы данных.
+'
+' Примечания:
+'   1. Удаляет связанные таблицы, у которых свойство Connect не пустое.
+'   2. Удаляет запросы, у которых свойство Connect не пустое.
+'   3. Если текущая база данных подключена к PostgreSQL, переименовывает запросы, начинающиеся с "Access_",
+'      удаляя префикс "Access_".
+'
+' Обработка ошибок: Использует On Error Resume Next для игнорирования ошибок при удалении объектов.
+'''
+Public Sub Unlink_Tables()
+    Dim db As DAO.Database                           ' Объект базы данных
+    Dim tdf As DAO.TableDef                           ' Объект TableDef (описание таблицы)
+    Dim strTableName As String                        ' Имя таблицы
+    Dim qdf As DAO.QueryDef                           ' Объект QueryDef (описание запроса)
+    Dim strQueryName As String                        ' Имя запроса
+    
+    On Error Resume Next                                ' Обработка ошибок: продолжаем выполнение при возникновении ошибки
+
+    Set db = CurrentDb                                  ' Устанавливаем ссылку на текущую базу данных
+
+    ' Удаляем связанные таблицы
+    For Each tdf In db.TableDefs                      ' Перебираем все TableDef в базе данных
+        strTableName = tdf.Name                        ' Получаем имя текущей таблицы
+        If tdf.Connect <> "" Then                      ' Если строка подключения не пустая, значит, это связанная таблица
+            DoCmd.DeleteObject acTable, strTableName  ' Удаляем таблицу
+        End If
+    Next tdf
+
+    ' Удаляем связанные запросы
+    For Each qdf In CurrentDb.QueryDefs                ' Перебираем все QueryDef в базе данных
+        If qdf.Connect <> "" Then                      ' Если строка подключения не пустая, значит, это связанный запрос
+            CurrentDb.QueryDefs.Delete qdf.Name       ' Удаляем запрос
+        End If
+    Next qdf
+
+    ' Если текущая база данных подключена к PostgreSQL, переименовываем запросы, начинающиеся с "Access_"
+    If Not IsNull(DLookup("spec_client", "Current Base")) Then
+        If DLookup("spec_client", "Current Base") = "PostgreSQL" Then
+            For Each qdf In CurrentDb.QueryDefs        ' Перебираем все QueryDef в базе данных
+                strQueryName = qdf.Name                  ' Получаем имя текущего запроса
+                If Left(strQueryName, 7) = "Access_" Then ' Если имя запроса начинается с "Access_"
+                    On Error Resume Next               ' Обработка ошибок: продолжаем выполнение при возникновении ошибки
+                    qdf.Name = Mid(strQueryName, 8)     ' Удаляем префикс "Access_"
+                    If Err.Number <> 0 Then              ' Если произошла ошибка
+                        Err.Clear                        ' Очищаем объект Err
+                    End If
+                    On Error GoTo 0                      ' Возвращаем стандартную обработку ошибок
+                End If
+            Next qdf
+        End If
+    End If
+
+    Set tdf = Nothing                                   ' Освобождаем объект
+    Set db = Nothing                                    ' Освобождаем объект
+End Sub
+
+'''
+' Функция: LinkPostgreSQLTables
+' Описание:  Подключает таблицы и представления из базы данных PostgreSQL в текущую базу данных Access.
+'
+' Аргументы:
+'   ipServer (String): IP-адрес сервера PostgreSQL.
+'   port (String): Номер порта сервера PostgreSQL.
+'   baseName (String): Имя базы данных PostgreSQL.
+'   password (String): Пароль для подключения к базе данных PostgreSQL.
+'   Optional login (String): Имя пользователя для подключения к базе данных PostgreSQL (по умолчанию - имя пользователя Windows).
+'
+' Примечания:
+'   1. Сначала отключает все существующие связанные таблицы.
+'   2. Подключает таблицы из таблицы sysTables, имеющие TableType = 'DATA_GUIR'.
+'   3. Подключает представления из pg_views, исключая представления, начинающиеся с 'analysis_%' или содержащие пробелы.
+'   4. Добавляет первичные ключи к подключенным представлениям.
+'
+' Обработка ошибок: Если имя пользователя не указано, использует имя пользователя Windows.
+'''
+Public Function LinkPostgreSQLTables(ByVal ipServer As String, ByVal port As String, ByVal baseName As String, ByVal password As String, Optional ByVal login As String)
+
+    Dim rsSysTables As DAO.Recordset                         ' Набор записей с информацией о таблицах
+    Dim rsViews As DAO.Recordset                           ' Набор записей с информацией о представлениях
+    Dim strSQL As String                                       ' Строка SQL запроса
+    Dim strTableName As String                                 ' Имя таблицы
+    Dim strPostgreSQLConnectionString As String               ' Строка подключения к PostgreSQL
+    Dim tdf As TableDef                                        ' Объект TableDef (описание таблицы)
+    Dim recordsCount As Long                                   ' Счетчик записей (не используется, но оставлен для соответствия исходному коду)
+    Dim pb As Object                                           ' Объект ProgressBar (не используется в данном коде)
+    Dim qdf As DAO.QueryDef                                      ' Объект QueryDef (описание запроса)
+    Dim verOs As String                                          ' Версия операционной системы (не используется)
+    Dim strObjectName As String                                  ' Имя объекта (не используется)
+    Dim dbPostgreSQL As DAO.Database                           ' Объект базы данных PostgreSQL (не используется)
+    Dim strViewName As String                                  ' Имя представления
+    Dim qdfPg As DAO.QueryDef                                    ' Объект QueryDef для PostgreSQL
+    Dim strQueryDefName As String                                ' Имя запроса
+
+    ' Если имя пользователя не указано, используем имя пользователя Windows
+    If IsNull(login) Or login = "" Then login = Environ("username")
+
+    ' Формируем строку подключения к PostgreSQL в зависимости от разрядности системы
+    #If Win64 Then
+        strPostgreSQLConnectionString = "ODBC;Driver={PostgreSQL Unicode(x64)};Server=" & ipServer & ";Port=" & port & ";Database=" & baseName & ";Uid=" & login & ";Pwd=" & password & ";"
+    #Else
+        strPostgreSQLConnectionString = "ODBC;Driver={PostgreSQL Unicode};Server=" & ipServer & ";Port=" & port & ";Database=" & baseName & ";Uid=" & login & ";Pwd=" & password & ";"
+    #End If
+
+    ' Отключаем существующие связанные таблицы и представления
+    Call Unlink_Tables
+
+    ' Обновляем информацию о текущей базе данных в таблице tbSpec_client
+    DoCmd.RunSQL "UPDATE tbSpec_client SET Current_Base = 'PostgreSQL';"
+
+    ' Получаем ссылку на ProgressBar (не используется в данном коде)
+    'Set pb = Forms("fm_path_server").pbar
+
+    ' Получаем список таблиц из таблицы sysTables, имеющих TableType = 'DATA_GUIR'
+    Set rsSysTables = CurrentDb.OpenRecordset("SELECT TableName FROM sysTables WHERE TableType = 'DATA_GUIR'", dbOpenSnapshot)
+
+    ' Создаем QueryDef для получения списка представлений из PostgreSQL
+    Set qdfPg = CurrentDb.CreateQueryDef("", "SELECT viewname FROM pg_views WHERE schemaname = 'public' AND viewname NOT LIKE 'analysis_%' AND viewname NOT LIKE '% %';")
+    qdfPg.Connect = strPostgreSQLConnectionString
+    Set rsViews = qdfPg.OpenRecordset(dbOpenSnapshot)
+
+    ' Подключаем таблицы
+    If Not rsSysTables.EOF Then
+        rsSysTables.MoveFirst                           ' Переходим к первой записи (если есть)
+
+        Do While Not rsSysTables.EOF                       ' Цикл по всем таблицам
+            strTableName = LCase(rsSysTables!TableName)    ' Получаем имя таблицы и преобразуем в нижний регистр
+
+            ' Исключаем таблицу "shabl"
+            If Not strTableName = "shabl" Then
+                Call CreateLinkedTable_PostgreSQL(strTableName, strPostgreSQLConnectionString) ' Создаем связанную таблицу
+            End If
+
+            rsSysTables.MoveNext                           ' Переходим к следующей таблице
+        Loop
+    End If
+
+    ' Подключаем представления
+    If Not rsViews.EOF Then
+        rsViews.MoveFirst                               ' Переходим к первому представлению (если есть)
+        Do While Not rsViews.EOF                           ' Цикл по всем представлениям
+            strViewName = rsViews!viewName                ' Получаем имя представления
+
+            ' Переименовываем существующий запрос (если он есть)
+            If QueryDefExists(strViewName) Then
+                RenameQueryDef strViewName, "Access_" & strViewName
+            End If
+
+            ' Создаем связанное представление
+            Call CreateLinkedView_PostgreSQL(strViewName, strPostgreSQLConnectionString)
+
+            ' Добавляем первичный ключ к связанному представлению
+            Call AddPrimaryKeyToLinkedTable(strViewName, strPostgreSQLConnectionString)
+            rsViews.MoveNext                               ' Переходим к следующему представлению
+        Loop
+    End If
+
+    ' Закрываем наборы записей и освобождаем объекты
+    rsSysTables.Close
+    Set rsSysTables = Nothing
+    rsViews.Close
+    Set rsViews = Nothing
+
+End Function
