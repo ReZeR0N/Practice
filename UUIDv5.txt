@@ -1,0 +1,283 @@
+Option Explicit
+
+'---------------------------------------------------------------------------------------
+' Модуль:  Модуль содержит функции для генерации UUID v5.
+' Автор:   [ZeRoN]
+' Дата создания: [17.10.2024]
+' Дата изменения: [25.11.2024]
+'---------------------------------------------------------------------------------------
+
+'-------------- Импорт библиотек для криптографии и работы с байтами --------------
+
+'RtlMoveMemory: Копирует блок памяти из одного места в другое( используется для работы с байтами)
+Private Declare PtrSafe Sub RtlMoveMemory Lib "kernel32" (ByVal dest As LongPtr, ByVal source As LongPtr, ByVal lenght As Long)
+'BCryptOpenAlgorithmProvider: Открывает провайдер криптографического алгоритма(например, SHA1)
+Private Declare PtrSafe Function BCryptOpenAlgorithmProvider Lib "bcrypt.dll" (ByRef phAlgorithm As LongPtr, ByVal psgAlgId As String, ByVal pszImplementation As String, ByVal dwFlags As Long) As Long
+'BCryptCloseAlgorithmProvider: Закрывает провайдер криптографического алгоритма
+Private Declare PtrSafe Function BCryptCloseAlgorithmProvider Lib "bcrypt.dll" (ByRef hObject As LongPtr, ByVal flags As Long) As Long
+'BCryptCreateHash: Создает объект хэша для алгоритма (например, SHA1)
+Private Declare PtrSafe Function BCryptCreateHash Lib "bcrypt.dll" (ByVal hAlgorithm As LongPtr, ByRef phHash As LongPtr, ByVal phHashObject As LongPtr, ByVal cbHashObject As Long, ByVal pbSecret As LongPtr, ByVal cbSecret As Long, ByVal dwFlags As Long) As Long
+'BCryptHashData: Хеширует данные
+Private Declare PtrSafe Function BCryptHashData Lib "bcrypt.dll" (ByVal hHash As LongPtr, ByVal pbInput As LongPtr, ByVal cbInput As Long, ByVal dwFlags As Long) As Long
+'BCryptFinishHash: Завершает хеширование и возвращает результат хэша
+Private Declare PtrSafe Function BCryptFinishHash Lib "bcrypt.dll" (ByVal hHash As LongPtr, ByVal pbOutput As LongPtr, ByVal cbOutput As Long, ByVal dwFlags As Long) As Long
+'BCryptDestroyHash: Уничтожает объект хэша
+Private Declare PtrSafe Function BCryptDestroyHash Lib "bcrypt.dll" (ByVal hHash As LongPtr) As Long
+
+'-------------------------- Функция преобразования данных --------------------------
+
+' Преобразует строку в шестнадцатеричном формате в массив байтов.
+' hexString: Строка в шестнадцатеричном формате.
+' Возвращает: Массив байтов.
+Private Function HexStringToByteArray(ByVal hexString As String) As Byte()
+
+    Dim i As Long                                  ' Индекс для перебора символов строки
+    Dim byteArray() As Byte                          ' Массив для хранения байтов
+    ReDim byteArray(Len(hexString) \ 2 - 1)          ' Размер массива будет половина длины строки
+    
+    For i = 0 To Len(hexString) - 2 Step 2          ' Проходим по строке по два символа
+        byteArray(i \ 2) = CByte("&H" & Mid(hexString, i + 2, 2)) ' Преобразуем пару символов в байт
+    Next i
+    
+    HexStringToByteArray = byteArray
+    
+End Function
+
+' Преобразует массив байтов в строку в шестнадцатеричном формате.
+' byteArray: Массив байтов.
+' Возвращает: Строка в шестнадцатеричном формате.
+Private Function ByteArrayToHexString(byteArray() As Byte) As String
+
+    Dim i As Long                                 ' Индекс для перебора элементов массива
+    Dim hexString As String                        ' Строка для хранения шестнадцатеричного представления
+    
+    For i = 0 To UBound(byteArray)
+        hexString = hexString & Right("0" & Hex(byteArray(i)), 2) ' Преобразуем каждый байт в 2-символьную строку в шестнадцатеричном формате
+    Next i
+    
+    ByteArrayToHexString = hexString
+    
+End Function
+
+' Получает текущее время как Double и преобразует его в массив байтов.
+' Возвращает: Массив байтов, представляющий текущее время.
+Private Function GetPreciseTimeBytes() As Byte()
+
+    Dim timeValue As Double                        ' Значение времени в формате Double
+    timeValue = Timer + Now() - Date               ' Вычисляем точное значение времени
+    Dim byteArr(7) As Byte                       ' Массив для хранения байтов времени
+    
+    Call RtlMoveMemory(VarPtr(byteArr(0)), VarPtr(timeValue), 8) ' Копируем байты времени в массив
+    
+    GetPreciseTimeBytes = byteArr
+    
+End Function
+
+' Генерирует массив байтов заданной длины со случайными значениями.
+' lenght: Длина массива байтов.
+' Возвращает: Массив случайных байтов.
+Private Function GetRandomBytes(lenght As Long) As Byte()
+
+    Dim i As Long                                 ' Индекс для перебора массива
+    Dim randomBytes() As Byte                      ' Массив для хранения случайных байтов
+    ReDim randomBytes(lenght - 1)                  ' Изменяем размер массива до заданной длины
+    
+    For i = 0 To lenght - 1
+        randomBytes(i) = Int(Rnd * 256)          ' Заполняем массив случайными байтами
+    Next i
+    
+    GetRandomBytes = randomBytes
+    
+End Function
+
+'---------------------------- Функция генерации UUID ----------------------------
+
+' Генерирует UUID v5 для пространства имен пользователя на основе имени пользователя.
+' userName: Имя пользователя.
+' Возвращает: UUID v5 в строковом представлении.
+Private Function GenerateNamespaceUUID(ByVal userName As String) As String
+
+    'Базовое пространство имен для генерации UUID
+    Const BASE_NAMESPACE_URL As String = "6a7b810-9dad-11d1-80b4-00c04fd430c8"
+    
+    Dim namespaceBytes() As Byte                 ' Массив байтов для пространства имен
+    Dim nameBytes() As Byte                      ' Массив байтов для имени пользователя
+    Dim combinedBytes() As Byte                  ' Массив для объединения байтов
+    Dim hashBytes() As Byte                      ' Массив для хранения хэша
+    Dim uuid As String                           ' Строка для хранения UUID
+    Dim hAlg As LongPtr                          ' Указатель на алгоритм
+    Dim hHash As LongPtr                         ' Указатель на хэш
+    Dim status As Long                           ' Статус выполнения операций
+    Dim SHA1_ALGO As String                      ' Строка для обозначения алгоритма SHA1
+    
+    'Проверка платформы  и выбор правильного алгоритма хеширования (Является условностью)
+    #If VBA7 Then
+        SHA1_ALGO = "SHA1"
+    #Else
+        SHA1_ALGO = "SHA1"
+    #End If
+    
+    'Преобразуем BASE_NAMESPACE_URL в байты
+    namespaceBytes = HexStringToByteArray(Replace(BASE_NAMESPACE_URL, "-", ""))
+    
+    'Преобразуем имя пользователя в массив байтов, используя кодировку UTF-8
+    nameBytes = StrConv(userName, vbFromUnicode)
+    
+    'Объединяем байты пространства имен и байты имени в один массив байтов
+    ReDim combinedBytes(UBound(namespaceBytes) + UBound(nameBytes) + 1)
+    RtlMoveMemory VarPtr(combinedBytes(0)), VarPtr(namespaceBytes(0)), UBound(namespaceBytes) + 1
+    RtlMoveMemory VarPtr(combinedBytes(UBound(namespaceBytes) + 1)), VarPtr(nameBytes(0)), UBound(nameBytes) + 1
+    
+    'Инициализация SHA1 хеш провайдера
+    status = BCryptOpenAlgorithmProvider(hAlg, StrConv(SHA1_ALGO, vbUnicode), vbNullString, 0)
+    If status <> 0 Then
+        GenerateNamespaceUUID = "Ошибка открытия алгоритма хеширования: " & status & " " & SHA1_ALGO
+        Exit Function
+    End If
+    
+    'Создание объекта хэша SHA1
+    status = BCryptCreateHash(hAlg, hHash, 0&, 0, 0&, 0, 0)
+    If status <> 0 Then
+        GenerateNamespaceUUID = "Ошибка создания объекта хэша: " & status
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Хеширование данных
+    status = BCryptHashData(hHash, VarPtr(combinedBytes(0)), UBound(combinedBytes) + 1, 0)
+    If status <> 0 Then
+        GenerateNamespaceUUID = "Ошибка хеширования данных: " & status
+        Call BCryptDestroyHash(hHash)
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Получение хэша SHA1
+    ReDim hashBytes(19)
+    status = BCryptFinishHash(hHash, VarPtr(hashBytes(0)), 20, 0)
+    If status <> 0 Then
+        GenerateNamespaceUUID = "Ошибка завершения хеширования: " & status
+        Call BCryptDestroyHash(hHash)
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Очищаем ресурсы, уничтожая хэш-объекты и закрывая провайдер алгоритма
+    Call BCryptDestroyHash(hHash)
+    Call BCryptCloseAlgorithmProvider(hAlg, 0)
+
+    'Устанавливаем биты версии и варианта, как указано в стандарте UUID v5
+    hashBytes(6) = (hashBytes(6) And &HF) Or &H50
+    hashBytes(8) = (hashBytes(8) And &H3F) Or &H80
+    
+    'Формирование UUID v5 путем преобразования байтов в UUID
+    uuid = ByteArrayToHexString(hashBytes)
+    uuid = Left(uuid, 8) & "-" & Mid(uuid, 9, 4) & "-" & Mid(uuid, 13, 4) & "-" & Mid(uuid, 17, 4) & "-" & Mid(uuid, 21, 12)
+    
+    GenerateNamespaceUUID = uuid
+    
+End Function
+
+' Основная функция генерации UUID v5.
+' Возвращает: Сгенерированный UUID v5 в строковом представлении.
+Public Function GenerateUUIDv5() As String
+
+    Dim namespaceBytes() As Byte                     ' Массив байтов для пространства имен
+    Dim nameBytes() As Byte                          ' Массив байтов для имени
+    Dim combinedBytes() As Byte                      ' Массив для объединения байтов
+    Dim hashBytes() As Byte                          ' Массив для хранения хэша
+    Dim uuid As String                               ' Строка для хранения UUID
+    Dim hAlg As LongPtr                              ' Указатель на алгоритм
+    Dim hHash As LongPtr                             ' Указатель на хэш
+    Dim status As Long                               ' Статус выполнения операций
+    Dim SHA1_ALGO As String                          ' Строка для обозначения алгоритма SHA1
+    Dim userName As String                           ' Имя пользователя
+    Dim namespaceUUID As String                      ' UUID пространства имен
+    
+    'Получаем имя пользователя
+    userName = DLookup("idfio", "tbFIO", "netFIO = '" & Environ("username") & "'")
+    'userName = "E8F86191-A703-50D6-8978-EB143E7D2D89"
+     'Проверка платформы  и выбор правильного алгоритма хеширования (Является условностью)
+    #If VBA7 Then
+        SHA1_ALGO = "SHA1"
+    #Else
+        SHA1_ALGO = "SHA1"
+    #End If
+    
+    'Генерируем Namespace UUID
+    namespaceUUID = GenerateNamespaceUUID(userName)
+    
+    namespaceBytes = HexStringToByteArray(Replace(namespaceUUID, "-", ""))
+
+    Dim timeBytes() As Byte                          ' Массив байтов для времени
+    timeBytes = GetPreciseTimeBytes()                 ' Получаем байты времени
+    Dim randomBytes() As Byte                        ' Массив байтов для случайных данных
+    randomBytes = GetRandomBytes(4)                   ' Получаем случайные байты
+    
+    'Объединяем байты времени и случайные байты в один массив байтов
+    ReDim nameBytes(UBound(timeBytes) + UBound(randomBytes) + 1)
+    RtlMoveMemory VarPtr(nameBytes(0)), VarPtr(timeBytes(0)), UBound(timeBytes) + 1
+    RtlMoveMemory VarPtr(nameBytes(UBound(timeBytes) + 1)), VarPtr(randomBytes(0)), UBound(randomBytes) + 1
+    
+    'Объединяем байты пространства имен и сгенерированные байты имени в один массив байтов
+    ReDim combinedBytes(UBound(namespaceBytes) + UBound(nameBytes) + 1)
+    RtlMoveMemory VarPtr(combinedBytes(0)), VarPtr(namespaceBytes(0)), UBound(namespaceBytes) + 1
+    RtlMoveMemory VarPtr(combinedBytes(UBound(namespaceBytes) + 1)), VarPtr(nameBytes(0)), UBound(nameBytes) + 1
+    
+    'Инициализация SHA1 хеш провайдера
+    status = BCryptOpenAlgorithmProvider(hAlg, StrConv(SHA1_ALGO, vbUnicode), vbNullString, 0)
+    If status <> 0 Then
+        GenerateUUIDv5 = "Ошибка открытия алгоритма хеширования: " & status & " " & SHA1_ALGO
+        Exit Function
+    End If
+    
+    'Создание объекта хэша SHA1
+    status = BCryptCreateHash(hAlg, hHash, 0&, 0, 0&, 0, 0)
+    If status <> 0 Then
+        GenerateUUIDv5 = "Ошибка создания объекта хэша: " & status
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Хеширование данных
+    status = BCryptHashData(hHash, VarPtr(combinedBytes(0)), UBound(combinedBytes) + 1, 0)
+    If status <> 0 Then
+        GenerateUUIDv5 = "Ошибка хеширования данных: " & status
+        Call BCryptDestroyHash(hHash)
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Получение хэша SHA1
+    ReDim hashBytes(19)
+    status = BCryptFinishHash(hHash, VarPtr(hashBytes(0)), 20, 0)
+    If status <> 0 Then
+        GenerateUUIDv5 = "Ошибка завершения хеширования: " & status
+        Call BCryptDestroyHash(hHash)
+        Call BCryptCloseAlgorithmProvider(hAlg, 0)
+        Exit Function
+    End If
+    
+    'Очищаем ресурсы, уничтожая хэш-объекты и закрывая провайдер алгоритма
+    Call BCryptDestroyHash(hHash)
+    Call BCryptCloseAlgorithmProvider(hAlg, 0)
+    
+    'Устанавливаем биты версии и варианта, как указано в стандарте UUID v5
+    hashBytes(6) = (hashBytes(6) And &HF) Or &H50
+    hashBytes(8) = (hashBytes(8) And &H3F) Or &H80
+    
+    'Формирование UUID v5 путем преобразования байтов в UUID
+    uuid = ByteArrayToHexString(hashBytes)
+    uuid = Left(uuid, 8) & "-" & Mid(uuid, 9, 4) & "-" & Mid(uuid, 13, 4) & "-" & Mid(uuid, 17, 4) & "-" & Mid(uuid, 21, 12)
+    
+    GenerateUUIDv5 = uuid
+      
+End Function
+
+'------------------------ Функция запуска генерации UUID ------------------------
+
+' Генерирует UUID и возвращает его
+' Возвращает: Сгенерированный UUID
+Public Function UUIDGeneration() As String  
+    UUIDGeneration = GenerateUUIDv5() 
+End Function
